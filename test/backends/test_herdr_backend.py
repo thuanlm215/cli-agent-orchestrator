@@ -78,6 +78,9 @@ class TestHerdrBackendABC:
         ]:
             assert callable(getattr(backend, method))
 
+    def test_declares_atomic_agent_prompt_capability(self, backend):
+        assert backend.supports_atomic_agent_prompt() is True
+
 
 # --- Command Construction ---
 
@@ -382,7 +385,39 @@ class TestHerdrBackendCommands:
         assert "Enter" in calls[-1]
 
     @patch("subprocess.run")
-    def test_send_keys_force_bracketed_wraps_when_pane_runs_a_real_tui(self, mock_run, backend):
+    def test_atomic_agent_prompt_resolves_pane_and_preserves_multiline_payload(
+        self, mock_run, backend
+    ):
+        """Native prompting targets the mapped pane, not an ambiguous tab label."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(),
+        ]
+
+        backend.send_atomic_agent_prompt("cao-test", "window-0", "first line\nsecond line")
+
+        command = mock_run.call_args_list[-1][0][0]
+        assert command[-4:] == ["agent", "prompt", "w1-1", "first line\nsecond line"]
+
+    @patch("subprocess.run")
+    def test_atomic_agent_prompt_redacts_payload_on_failure(self, mock_run, backend):
+        failed = _completed(returncode=1)
+        failed.stderr = "agent not found"
+        mock_run.return_value = failed
+
+        with pytest.raises(TerminalBackendError) as exc_info:
+            backend._run_herdr(["agent", "prompt", "w1-1", "private\nmessage"])
+
+        assert "private" not in str(exc_info.value)
+
+    @patch("subprocess.run")
+    def test_send_keys_force_bracketed_non_shell_fails_before_typing(self, mock_run, backend):
+        """Do not replace paste with pane run, which adds an implicit Enter."""
         ws = [{"label": "cao-test", "workspace_id": "w1"}]
         tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
         panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
@@ -391,16 +426,96 @@ class TestHerdrBackendCommands:
             _completed(_make_workspace_list_response(ws)),
             _completed(_make_tab_list_response(tabs)),
             _completed(_make_pane_list_response(panes)),
-            _completed(),  # send-text
-            _completed(),  # send-keys Enter
         ]
 
         with patch.object(backend, "get_pane_current_command", return_value="node"):
-            backend.send_keys("cao-test", "window-0", "hello world", force_bracketed_paste=True)
+            with pytest.raises(TerminalBackendError, match="cannot perform forced bracketed paste"):
+                backend.send_keys(
+                    "cao-test", "window-0", "hello\\nworld", force_bracketed_paste=True
+                )
 
-        send_text_call = mock_run.call_args_list[-2][0][0]
-        text_arg = send_text_call[send_text_call.index("send-text") + 2]
-        assert text_arg == "\x1b[200~hello world\x1b[201~"
+        calls = [call[0][0] for call in mock_run.call_args_list]
+        assert not any(
+            "run" in call or "send-text" in call or "send-keys" in call for call in calls
+        )
+
+    @patch("subprocess.run")
+    def test_send_keys_force_bracketed_shell_fallback_preserves_legacy_delay_and_enter_count(
+        self, mock_run, backend
+    ):
+        """A shell gets literal input, then exactly the requested Enter keys."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(),  # send-text
+            _completed(),  # first Enter
+            _completed(),  # second Enter
+        ]
+
+        with (
+            patch.object(backend, "get_pane_current_command", return_value="bash"),
+            patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep") as sleep,
+        ):
+            backend.send_keys(
+                "cao-test",
+                "window-0",
+                "two-enter prompt",
+                enter_count=2,
+                force_bracketed_paste=True,
+                submit_delay=0.4,
+            )
+
+        calls = [call[0][0] for call in mock_run.call_args_list]
+        assert calls[-3][-4:] == ["pane", "send-text", "w1-1", "two-enter prompt"]
+        assert all(call[-3:] == ["send-keys", "w1-1", "Enter"] for call in calls[-2:])
+        sleep.assert_called_once_with(2.0)
+
+    @patch("subprocess.run")
+    def test_send_keys_zero_enters_never_submits(self, mock_run, backend):
+        """The generic contract permits typing without an implicit Enter."""
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(),
+        ]
+
+        with patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep") as sleep:
+            backend.send_keys("cao-test", "window-0", "draft", enter_count=0)
+
+        calls = [call[0][0] for call in mock_run.call_args_list]
+        assert calls[-1][-4:] == ["pane", "send-text", "w1-1", "draft"]
+        assert not any("send-keys" in call for call in calls)
+        sleep.assert_not_called()
+
+    @patch("subprocess.run")
+    def test_send_keys_nonforced_zero_enters_preserves_configured_delay(self, mock_run):
+        """Typing-only calls retain Herdr's legacy configured send delay."""
+        with patch(
+            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
+        ):
+            delayed_backend = HerdrBackend(send_delay_ms=250)
+        ws = [{"label": "cao-test", "workspace_id": "w1"}]
+        tabs = [{"tab_id": "tab-0", "workspace_id": "w1", "label": "window-0"}]
+        panes = [{"tab_id": "tab-0", "pane_id": "w1-1", "workspace_id": "w1"}]
+        mock_run.side_effect = [
+            _completed(_make_workspace_list_response(ws)),
+            _completed(_make_tab_list_response(tabs)),
+            _completed(_make_pane_list_response(panes)),
+            _completed(),
+        ]
+
+        with patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep") as sleep:
+            delayed_backend.send_keys("cao-test", "window-0", "draft", enter_count=0)
+
+        sleep.assert_called_once_with(0.25)
 
     @patch("subprocess.run")
     def test_send_keys_force_bracketed_skips_wrap_for_bare_shell(self, mock_run, backend):

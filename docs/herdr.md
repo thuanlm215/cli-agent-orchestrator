@@ -96,7 +96,15 @@ CAO maps its concepts to herdr primitives:
 
 ### Event-driven inbox delivery
 
-`HerdrInboxService` connects to the herdr Unix socket at startup and subscribes to `pane.agent_status_changed` events for each managed pane. When a pane transitions to `idle` or `done`, pending inbox messages are delivered immediately.
+`HerdrInboxService` connects to the herdr Unix socket at startup and subscribes
+once to broadcast `pane.updated` events plus lifecycle events. When a managed
+pane transitions to `idle` or `done`, pending inbox messages are delivered
+immediately.
+
+Herdr 0.8's scoped protocol-19 status stream has not yet been validated for
+dynamic multi-pane inbox delivery. Treat event-driven inbox delivery on that
+release as experimental; CAO's normal inbox reconciliation remains the safe
+fallback until the native behavior is validated end-to-end.
 
 ### Startup and reconnect behavior
 

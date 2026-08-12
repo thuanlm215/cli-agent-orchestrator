@@ -1,15 +1,13 @@
 """HerdrInboxService — socket event-based inbox delivery for herdr backend.
 
 Replaces the pipe-pane + file watchdog approach with herdr's native socket API.
-Subscribes to a broadcast pane.updated event (whose payload carries
-agent_status) and delivers pending inbox messages when a pane transitions to
-idle or done.
+Subscribes to broadcast pane events and delivers pending inbox messages when a
+pane transitions to idle or done.
 
 Design:
 - Maintains a pane_id → terminal_id map for managed panes
-- Subscribes once to a broadcast pane.updated (no pane_id) covering all panes,
-  so a newly registered pane's events already arrive — registration updates the
-  map only and never re-subscribes or forces a reconnect
+- Sends one combined broadcast/lifecycle subscription request per socket
+  connection
 - Reconnects with exponential backoff on socket disconnect
 - Supplements with periodic pane read for kiro-cli (working >30s check)
 """
@@ -221,10 +219,6 @@ class HerdrInboxService:
                 # Reconcile map against live herdr state before subscribing
                 await self._reconcile()
 
-                # Subscribe to everything in ONE events.subscribe call: a single
-                # broadcast pane.updated (no pane_id) plus the lifecycle events.
-                # herdr resets the connection on a second events.subscribe, so
-                # this must be a single combined call.
                 await self._subscribe_all_events()
 
                 self._backoff = _BACKOFF_BASE  # Reset backoff after successful setup
@@ -467,12 +461,9 @@ class HerdrInboxService:
         subscription, so this must remain exactly one events.subscribe per
         connection.
 
-        The subscription is a broadcast pane.updated (sent with NO pane_id):
-        herdr streams it for every pane and its payload carries agent_status,
-        so a single broadcast subscription replaces the former per-pane
-        pane.agent_status_changed subscriptions. This is independent of
-        _pane_to_terminal — no per-pane enumeration is needed. The pane.closed
-        and workspace.closed lifecycle events are sent in the same call.
+        ``pane.updated`` is broadcast (no pane_id) and carries agent status for
+        every pane, so registration only updates the map and never needs a
+        second subscription on this connection.
         """
         subscriptions = [
             {"type": "pane.updated"},
@@ -485,10 +476,7 @@ class HerdrInboxService:
             "params": {"subscriptions": subscriptions},
         }
         await self._send(message)
-        logger.info(
-            "Subscribed to broadcast pane.updated + lifecycle events "
-            "in one events.subscribe call"
-        )
+        logger.info("Subscribed to broadcast pane.updated + lifecycle events in one call")
 
     async def _event_loop(self) -> None:
         """Listen for events and dispatch delivery."""
@@ -518,10 +506,9 @@ class HerdrInboxService:
                 continue
 
             data = event.get("data", {})
-            # Broadcast pane.updated nests the pane under data.pane; retired
-            # agent-status events used top-level data. Fall back to data, and
-            # guard against a null/non-dict pane so one malformed event cannot
-            # escape the loop and kill delivery.
+            # pane.agent_status_changed has pane_id and agent_status directly
+            # in data. Keep the nested-pane fallback for older Herdr envelopes,
+            # and guard against malformed data so one frame cannot kill delivery.
             pane_obj = data.get("pane") or data
             if not isinstance(pane_obj, dict):
                 pane_obj = {}
@@ -533,7 +520,11 @@ class HerdrInboxService:
             if not terminal_id:
                 continue
 
-            if status in ("idle", "done"):
+            # Herdr 0.8 emits ``ready`` after an agent finishes a turn. Older
+            # releases used ``idle``/``done`` for the same terminal condition.
+            # Treat all three as deliverable: otherwise a correctly received
+            # 0.8 event remains pending until periodic reconciliation.
+            if status in ("ready", "idle", "done"):
                 # Clear working timestamp
                 self._working_since.pop(terminal_id, None)
                 # Trigger delivery

@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 # Herdr CLI subcommands that _run_herdr is allowed to invoke.
 _HERDR_ALLOWED_SUBCOMMANDS = frozenset(
     {
+        "agent",
         "workspace",
         "tab",
         "pane",
@@ -97,7 +98,10 @@ def _sanitize_herdr_args(args: List[str]) -> List[str]:
     # carry a terminal-input / shell-command payload at index 3+ that is
     # exempt from validation (it is content, not an argument that alters
     # herdr's own routing or behavior).
-    if len(args) >= 2 and args[0] == "pane" and args[1] in ("send-text", "run"):
+    if len(args) >= 2 and (
+        (args[0] == "pane" and args[1] in ("send-text", "run"))
+        or (args[0] == "agent" and args[1] == "prompt")
+    ):
         structural_args = args[:3]
     else:
         structural_args = args
@@ -211,8 +215,9 @@ class HerdrBackend(TerminalBackend):
         # sources: send-text/run payloads (terminal input) and --env values
         # (operator-forwarded, potentially secret). Never let either reach an
         # exception, log, or HTTP error detail.
-        has_payload = (
-            len(sanitized) >= 3 and sanitized[0] == "pane" and sanitized[1] in ("send-text", "run")
+        has_payload = len(sanitized) >= 3 and (
+            (sanitized[0] == "pane" and sanitized[1] in ("send-text", "run"))
+            or (sanitized[0] == "agent" and sanitized[1] == "prompt")
         )
         if has_payload:
             cmd_display = cmd[:6] + ["<redacted>"]
@@ -461,16 +466,20 @@ class HerdrBackend(TerminalBackend):
         force_bracketed_paste: bool = False,
         submit_delay: float = 0.3,
     ) -> None:
-        """Send text to a pane via herdr pane send-text + send-keys Enter.
+        """Send literal text followed by the requested number of Enter keys.
 
-        When force_bracketed_paste=True, wraps content in \\x1b[200~...\\x1b[201~
-        so Claude Code's Ink TUI treats it as a paste event rather than raw
-        keystrokes. Without this, multi-line prompts go into multi-line mode
-        and the final Enter adds a newline instead of submitting.
+        Herdr 0.8 has no pane-level paste operation.  Its documented
+        ``agent prompt`` and ``pane run`` commands both submit an implicit
+        Enter atomically, so neither can implement this backend contract:
+        callers may request zero or multiple Enters and require a delay before
+        submission.  ``pane send-text`` is literal text, not a raw-byte API,
+        so passing DECSET 2004 framing through it is unsafe.
 
-        ``submit_delay`` is accepted for parity with the backend interface; herdr
-        governs its own post-paste timing below (the generous 2s bracketed wait
-        already covers Claude Code's Ink renderer), so the value is not used here.
+        Consequently, forced bracketed paste to a non-shell pane is rejected
+        without typing any part of the payload.  Bare shells are the existing
+        safe fallback: they deliberately receive ordinary literal text because
+        they do not support bracketed paste framing.  Non-forced delivery is
+        unchanged.
         """
         # Resolve pane_id from terminal_id stored in DB metadata
         # The window_name is used as a lookup key in CAO's DB → terminal_id mapping
@@ -478,41 +487,62 @@ class HerdrBackend(TerminalBackend):
         # which maps to a terminal in the DB. We'll resolve via the pane list.
         pane_id = self._resolve_pane_id_from_window(session_name, window_name)
 
-        # Wrap in bracketed paste sequences when requested -- UNLESS the pane's
-        # live foreground process is a known shell (see
+        # A bare shell is a safe non-bracketed fallback (see
         # BRACKETED_PASTE_INCOMPATIBLE_SHELLS' own docstring in constants.py):
         # a bare shell doesn't understand the escape sequences and glues them
         # onto the first token of whatever's sent, corrupting it. Same
         # tmux-backend fix (clients/tmux.py's
-        # _pane_is_bracketed_paste_incompatible), mirrored here since herdr's
-        # ``pane send-text`` writes raw bytes to the pty just like tmux's
-        # paste-buffer -- the same corruption is equally possible here, and
-        # herdr already exposes the same get_pane_current_command primitive.
-        # Fails closed to "compatible" (wraps, existing behavior) on a lookup
-        # failure or unrecognized command name. Only probed when
+        # _pane_is_bracketed_paste_incompatible), mirrored here.  Fails closed
+        # to "not safe to emulate" on a lookup failure or unrecognized command
+        # name. Only probed when
         # force_bracketed_paste is actually requested -- an extra herdr
         # round-trip whose result would otherwise be discarded.
-        if force_bracketed_paste and not self._pane_is_bracketed_paste_incompatible(
+        shell_fallback = force_bracketed_paste and self._pane_is_bracketed_paste_incompatible(
             session_name, window_name
-        ):
-            text = "\x1b[200~" + keys + "\x1b[201~"
-        else:
-            text = keys
+        )
+        if force_bracketed_paste and not shell_fallback:
+            raise TerminalBackendError(
+                "Herdr 0.8 cannot perform forced bracketed paste with the "
+                "TerminalBackend enter_count/submit_delay contract: `agent prompt` "
+                "and `pane run` submit an implicit Enter atomically, while "
+                "`pane send-text` accepts literal text only."
+            )
 
-        self._run_herdr(["pane", "send-text", pane_id, text])
+        self._run_herdr(["pane", "send-text", pane_id, keys])
 
-        # Allow the TUI to process the pasted content before sending Enter.
-        # For bracketed paste, the TUI needs time to process the end sequence
-        # and enter multi-line mode; 2s is intentionally generous.
-        # For non-bracketed paste, use the configurable send_delay_ms.
+        # Preserve generic send_keys timing. A forced request targeting a bare
+        # shell has always used the conservative 2s bracketed-paste settle
+        # window even though the shell receives literal text; non-forced calls
+        # retain the configured delay, including enter_count=0 calls.
         if force_bracketed_paste:
             time.sleep(2.0)
         elif self._send_delay_ms > 0:
             time.sleep(self._send_delay_ms / 1000.0)
 
-        # Send Enter key(s)
         for _ in range(enter_count):
             self._run_herdr(["pane", "send-keys", pane_id, "Enter"])
+
+    def supports_atomic_agent_prompt(self) -> bool:
+        """Herdr's ``agent prompt`` can submit one recognized-agent turn."""
+        return True
+
+    def send_atomic_agent_prompt(self, session_name: str, window_name: str, text: str) -> None:
+        """Submit one prompt through Herdr's bracket-aware native agent API.
+
+        The pane ID is resolved through CAO's workspace-label → tab-label →
+        pane mapping.  Herdr accepts that pane ID as an agent target, but only
+        if it has recognized a live interactive agent in the pane.  This is not
+        a substitute for ``send_keys``: it has one implicit Enter and no
+        pre-submit delay control.
+        """
+        pane_id = self._resolve_pane_id_from_window(session_name, window_name)
+        try:
+            self._run_herdr(["agent", "prompt", pane_id, text])
+        except TerminalBackendError as exc:
+            raise TerminalBackendError(
+                "Herdr could not atomically submit this prompt. The target pane must "
+                "contain a recognized interactive agent."
+            ) from exc
 
     def send_special_key(self, session_name: str, window_name: str, key: str) -> None:
         """Send a special key to a pane."""

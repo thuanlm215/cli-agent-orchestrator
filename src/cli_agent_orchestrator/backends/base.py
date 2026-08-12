@@ -156,9 +156,7 @@ class TerminalBackend(ABC):
             keys: Text to send
             enter_count: Number of Enter keys to send after the text
             force_bracketed_paste: If True, request bracketed-paste delivery.
-                The herdr backend wraps content in \\x1b[200~...\\x1b[201~
-                itself (it writes raw bytes to the pty, no sanitization). The
-                tmux backend hand-crafts the same wrap on tmux < 3.7 but must
+                The tmux backend hand-crafts framing on tmux < 3.7 but must
                 delegate to ``paste-buffer -p`` on >= 3.7, where pasted
                 buffers are vis(3)-sanitized and raw ESC bytes would arrive
                 as literal "^[[200~" (issue #413); -p emits markers only when
@@ -303,6 +301,26 @@ class TerminalBackend(ABC):
         Default is False (pipe-pane based delivery).
         """
         return False
+
+    def supports_atomic_agent_prompt(self) -> bool:
+        """Whether the backend can atomically submit one interactive prompt.
+
+        This is deliberately narrower than :meth:`send_keys`: it is only for
+        a recognized, interactive agent and always submits exactly one turn.
+        Callers must not use it to emulate the general input contract.
+        """
+        return False
+
+    def send_atomic_agent_prompt(self, session_name: str, window_name: str, text: str) -> None:
+        """Atomically submit exactly one prompt to a recognized agent.
+
+        Backends that do not advertise :meth:`supports_atomic_agent_prompt`
+        fail closed.  There is intentionally no enter-count or delay argument:
+        an atomic agent prompt cannot faithfully provide those controls.
+        """
+        raise TerminalBackendError(
+            "This terminal backend does not support atomic interactive agent prompts"
+        )
 
     def get_pane_id(self, terminal_id: str, session_name: str = "", window_name: str = "") -> str:
         """Resolve terminal_id to backend-specific pane identifier.

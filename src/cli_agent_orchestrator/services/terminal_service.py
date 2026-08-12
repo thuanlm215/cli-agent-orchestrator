@@ -1194,14 +1194,28 @@ def send_input(
         # latch-block the IDLE→PROCESSING transition for the whole turn.
         status_monitor.clear_rolling_buffer(terminal_id)
 
-        get_backend().send_keys(
-            metadata["tmux_session"],
-            metadata["tmux_window"],
-            message,
-            enter_count=enter_count,
-            force_bracketed_paste=True,
-            submit_delay=provider.paste_submit_delay if provider else 0.3,
-        )
+        backend = get_backend()
+        if (
+            metadata.get("provider") == ProviderType.GROK_CLI.value
+            and enter_count == 1
+            and backend.supports_atomic_agent_prompt() is True
+        ):
+            # Native agent prompt is intentionally selected only for CAO's
+            # ordinary one-Enter, forced-bracketed user-input path.  It is
+            # atomic, so a provider's paste_submit_delay cannot be applied
+            # without changing the submission semantics.
+            backend.send_atomic_agent_prompt(
+                metadata["tmux_session"], metadata["tmux_window"], message
+            )
+        else:
+            backend.send_keys(
+                metadata["tmux_session"],
+                metadata["tmux_window"],
+                message,
+                enter_count=enter_count,
+                force_bracketed_paste=True,
+                submit_delay=provider.paste_submit_delay if provider else 0.3,
+            )
 
         # Notify the provider that external input was received.
         # This allows providers to adjust status

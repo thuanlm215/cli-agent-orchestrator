@@ -7,6 +7,7 @@ import pytest
 
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
+from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.terminal_service import (
     OutputMode,
@@ -1345,6 +1346,7 @@ class TestSendInput:
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
+            "provider": ProviderType.GROK_CLI.value,
         }
         mock_provider = mock_pm.get_provider.return_value
         mock_provider.paste_enter_count = 2
@@ -1362,6 +1364,87 @@ class TestSendInput:
             submit_delay=0.3,
         )
         mock_update.assert_called_once_with("test1234")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_uses_atomic_prompt_only_for_one_enter(
+        self, mock_get_metadata, mock_backend, mock_pm, mock_update
+    ):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+            "provider": ProviderType.GROK_CLI.value,
+        }
+        provider = mock_pm.get_provider.return_value
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0.4
+        mock_backend.supports_atomic_agent_prompt.return_value = True
+
+        assert send_input("test1234", "first line\nsecond line") is True
+
+        mock_backend.send_atomic_agent_prompt.assert_called_once_with(
+            "cao-session", "developer-abcd", "first line\nsecond line"
+        )
+        mock_backend.send_keys.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_does_not_use_atomic_prompt_for_multiple_enters(
+        self, mock_get_metadata, mock_backend, mock_pm, mock_update
+    ):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        provider = mock_pm.get_provider.return_value
+        provider.paste_enter_count = 2
+        provider.paste_submit_delay = 0.4
+        mock_backend.supports_atomic_agent_prompt.return_value = True
+
+        assert send_input("test1234", "message") is True
+
+        mock_backend.send_atomic_agent_prompt.assert_not_called()
+        mock_backend.send_keys.assert_called_once_with(
+            "cao-session",
+            "developer-abcd",
+            "message",
+            enter_count=2,
+            force_bracketed_paste=True,
+            submit_delay=0.4,
+        )
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_non_grok_uses_generic_send_keys_even_when_atomic_is_available(
+        self, mock_get_metadata, mock_backend, mock_pm, mock_update
+    ):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+            "provider": ProviderType.COPILOT_CLI.value,
+        }
+        provider = mock_pm.get_provider.return_value
+        provider.paste_enter_count = 1
+        provider.paste_submit_delay = 0.4
+        mock_backend.supports_atomic_agent_prompt.return_value = True
+
+        assert send_input("test1234", "message") is True
+
+        mock_backend.send_atomic_agent_prompt.assert_not_called()
+        mock_backend.send_keys.assert_called_once_with(
+            "cao-session",
+            "developer-abcd",
+            "message",
+            enter_count=1,
+            force_bracketed_paste=True,
+            submit_delay=0.4,
+        )
 
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
